@@ -1,21 +1,23 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
 	"io"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	k8sjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
-
+	gabs "github.com/Jeffail/gabs/v2"
 	"github.com/rancher/support-bundle-kit/pkg/utils"
+	k8syaml "sigs.k8s.io/yaml"
 )
 
 type Cluster struct {
@@ -67,7 +69,7 @@ func (c *Cluster) GenerateClusterBundle(bundleDir string) (string, error) {
 	defer errLog.Close()
 
 	metaFile := filepath.Join(bundleDir, "metadata.yaml")
-	encodeToYAMLFile(bundleMeta, metaFile, errLog)
+	encodeToYAMLFile(bundleMeta, metaFile, errLog, nil)
 
 	yamlsDir := filepath.Join(bundleDir, "yamls")
 	c.generateSupportBundleYAMLs(yamlsDir, errLog)
@@ -82,7 +84,7 @@ func (c *Cluster) generateSupportBundleYAMLs(yamlsDir string, errLog io.Writer) 
 	// Cluster scope
 	globalDir := filepath.Join(yamlsDir, "cluster")
 	c.generateKubernetesClusterYAMLs(globalDir, errLog)
-	c.generateDiscoveredClusterYAMLs(globalDir, errLog)
+	//c.generateDiscoveredClusterYAMLs(globalDir, errLog)
 
 	// Namespaced scope: k8s resources
 	namespaces := []string{"default", "kube-system", "cattle-system"}
@@ -110,25 +112,96 @@ func wrap(ns string, getter NamespacedGetter) GetRuntimeObjectListFunc {
 	return wrapped
 }
 
+type DataModifier struct {
+	modifiers map[string]string
+}
+
 func (c *Cluster) generateKubernetesClusterYAMLs(dir string, errLog io.Writer) {
 	toDir := filepath.Join(dir, "kubernetes")
-	getListAndEncodeToYAML("nodes", c.sbm.k8s.GetAllNodesList, toDir, errLog)
-	getListAndEncodeToYAML("volumeattachments", c.sbm.k8s.GetAllVolumeAttachments, toDir, errLog)
-	getListAndEncodeToYAML("nodemetrics", c.sbm.k8sMetrics.GetAllNodeMetrics, toDir, errLog)
+	getListAndEncodeToYAML("nodes", c.sbm.k8s.GetAllNodesList, toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "v1",
+			"kind":      "Node",
+			"status.nodeInfo.machineID": "null",
+		},
+	})
+	getListAndEncodeToYAML("volumeattachments", c.sbm.k8s.GetAllVolumeAttachments, toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "metrics.k8s.io/v1beta1",
+			"kind": "VolumeAttachment",
+		},
+	})
+	getListAndEncodeToYAML("nodemetrics", c.sbm.k8sMetrics.GetAllNodeMetrics, toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "storage.k8s.io/v1",
+			"kind": "NodeMetrics",
+		},
+	})
 }
 
 func (c *Cluster) generateKubernetesNamespacedYAMLs(namespace string, dir string, errLog io.Writer) {
 	toDir := filepath.Join(dir, "kubernetes")
-	getListAndEncodeToYAML("events", wrap(namespace, c.sbm.k8s.GetAllEventsList), toDir, errLog)
-	getListAndEncodeToYAML("pods", wrap(namespace, c.sbm.k8s.GetAllPodsList), toDir, errLog)
-	getListAndEncodeToYAML("services", wrap(namespace, c.sbm.k8s.GetAllServicesList), toDir, errLog)
-	getListAndEncodeToYAML("deployments", wrap(namespace, c.sbm.k8s.GetAllDeploymentsList), toDir, errLog)
-	getListAndEncodeToYAML("daemonsets", wrap(namespace, c.sbm.k8s.GetAllDaemonSetsList), toDir, errLog)
-	getListAndEncodeToYAML("statefulsets", wrap(namespace, c.sbm.k8s.GetAllStatefulSetsList), toDir, errLog)
-	getListAndEncodeToYAML("jobs", wrap(namespace, c.sbm.k8s.GetAllJobsList), toDir, errLog)
-	getListAndEncodeToYAML("cronjobs", wrap(namespace, c.sbm.k8s.GetAllCronJobsList), toDir, errLog)
-	getListAndEncodeToYAML("configmaps", wrap(namespace, c.sbm.k8s.GetAllConfigMaps), toDir, errLog)
-	getListAndEncodeToYAML("podmetrics", wrap(namespace, c.sbm.k8sMetrics.GetAllPodMetrics), toDir, errLog)
+	getListAndEncodeToYAML("events", wrap(namespace, c.sbm.k8s.GetAllEventsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "v1",
+			"kind": "Event",
+		},
+	})
+	getListAndEncodeToYAML("pods", wrap(namespace, c.sbm.k8s.GetAllPodsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "v1",
+			"kind": "Pod",
+			"status.conditions.lastProbeTime": "null",
+		},
+	})
+	getListAndEncodeToYAML("services", wrap(namespace, c.sbm.k8s.GetAllServicesList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "v1",
+			"kind": "Service",
+		},
+	})
+	getListAndEncodeToYAML("deployments", wrap(namespace, c.sbm.k8s.GetAllDeploymentsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "apps/v1",
+			"kind": "Deployment",
+		},
+	})
+	getListAndEncodeToYAML("daemonsets", wrap(namespace, c.sbm.k8s.GetAllDaemonSetsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "apps/v1",
+			"kind": "DaemonSet",
+		},
+	})
+	getListAndEncodeToYAML("statefulsets", wrap(namespace, c.sbm.k8s.GetAllStatefulSetsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "apps/v1",
+			"kind": "StatefulSet",
+		},
+	})
+	getListAndEncodeToYAML("jobs", wrap(namespace, c.sbm.k8s.GetAllJobsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "batch/v1",
+			"kind": "Job",
+		},
+	})
+	getListAndEncodeToYAML("cronjobs", wrap(namespace, c.sbm.k8s.GetAllCronJobsList), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "batch/v1beta1",
+			"kind": "CronJob",
+		},
+	})
+	getListAndEncodeToYAML("configmaps", wrap(namespace, c.sbm.k8s.GetAllConfigMaps), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "v1",
+			"kind": "ConfigMap",
+		},
+	})
+	getListAndEncodeToYAML("podmetrics", wrap(namespace, c.sbm.k8sMetrics.GetAllPodMetrics), toDir, errLog, &DataModifier{
+		modifiers: map[string]string{
+			"apiVersion": "metrics.k8s.io/v1beta1",
+			"kind": "PodMetrics",
+		},
+	})
 }
 
 func (c *Cluster) generateDiscoveredNamespacedYAMLs(namespace string, dir string, errLog io.Writer) {
@@ -137,7 +210,7 @@ func (c *Cluster) generateDiscoveredNamespacedYAMLs(namespace string, dir string
 
 	for name, obj := range objs {
 		file := filepath.Join(dir, name+".yaml")
-		encodeToYAMLFile(obj, file, errLog)
+		encodeToYAMLFile(obj, file, errLog, nil)
 	}
 }
 
@@ -146,11 +219,11 @@ func (c *Cluster) generateDiscoveredClusterYAMLs(dir string, errLog io.Writer) {
 
 	for name, obj := range objs {
 		file := filepath.Join(dir, name+".yaml")
-		encodeToYAMLFile(obj, file, errLog)
+		encodeToYAMLFile(obj, file, errLog, nil)
 	}
 }
 
-func encodeToYAMLFile(obj interface{}, path string, errLog io.Writer) {
+func encodeToYAMLFile(obj interface{}, path string, errLog io.Writer, dataModifier *DataModifier) {
 	var err error
 	defer func() {
 		if err != nil {
@@ -161,21 +234,55 @@ func encodeToYAMLFile(obj interface{}, path string, errLog io.Writer) {
 	if err != nil {
 		return
 	}
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
+	scheme := runtime.NewScheme()
+	separator := []byte("---\n")
+
 	switch v := obj.(type) {
 	case runtime.Object:
-		serializer := k8sjson.NewSerializerWithOptions(k8sjson.DefaultMetaFactory, nil, nil, k8sjson.SerializerOptions{
-			Yaml:   true,
-			Pretty: true,
-			Strict: true,
+		serializer := k8sjson.NewSerializerWithOptions(k8sjson.DefaultMetaFactory, scheme, scheme, k8sjson.SerializerOptions{
+			Yaml:   false,
+			Pretty: false,
+			Strict: false,
 		})
-		if err = serializer.Encode(v, f); err != nil {
+		buf := new(bytes.Buffer)
+		if err = serializer.Encode(v, buf); err != nil {
 			return
+		}
+		jsonParsed, err := gabs.ParseJSON(buf.Bytes())
+		if err != nil {
+			return
+		}
+
+		for _, child := range jsonParsed.S("items").Children() {
+			//for k, v := range dataModifier.appends {
+			//	_, error := child.Set(v, k)
+			//	if error != nil {
+			//		logrus.Infof("can not set: %s, %s", k, v)
+			//	}
+			//}
+
+			for k, v := range dataModifier.modifiers {
+				_, error := child.SetP(v, k)
+				if error != nil {
+					logrus.Infof("can not setP: %s, %s", k, v)
+				}
+			}
+
+			data, err := k8syaml.JSONToYAML(child.Bytes())
+			if err != nil {
+				logrus.Info("can not convert back to yaml")
+			}
+			_, err = f.Write(separator)
+			_, err = f.Write(data)
+			if err != nil {
+				logrus.Info("can not write to file")
+			}
 		}
 	default:
 		encoder := yaml.NewEncoder(f)
@@ -190,12 +297,12 @@ func encodeToYAMLFile(obj interface{}, path string, errLog io.Writer) {
 
 type GetRuntimeObjectListFunc func() (runtime.Object, error)
 
-func getListAndEncodeToYAML(name string, getListFunc GetRuntimeObjectListFunc, yamlsDir string, errLog io.Writer) {
+func getListAndEncodeToYAML(name string, getListFunc GetRuntimeObjectListFunc, yamlsDir string, errLog io.Writer, dataModifier *DataModifier) {
 	obj, err := getListFunc()
 	if err != nil {
 		fmt.Fprintf(errLog, "Support Bundle: failed to get %v: %v\n", name, err)
 	}
-	encodeToYAMLFile(obj, filepath.Join(yamlsDir, name+".yaml"), errLog)
+	encodeToYAMLFile(obj, filepath.Join(yamlsDir, name+".yaml"), errLog, dataModifier)
 }
 
 func (c *Cluster) generateSupportBundleLogs(logsDir string, errLog io.Writer) {
