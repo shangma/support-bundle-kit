@@ -1,11 +1,11 @@
 package client
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"strings"
 
+	"github.com/Jeffail/gabs/v2"
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -30,26 +30,41 @@ func NewDiscoveryClient(ctx context.Context, config *rest.Config) (*DiscoveryCli
 	}, nil
 }
 
-func toObj(b []byte) interface{} {
-	var objMap map[string]interface{}
+func toObj(b []byte, groupVersion, kind string) interface{} {
 
-	r := bytes.NewReader(b)
-	d := json.NewDecoder(r)
+	replaceString := strings.ReplaceAll(string(b), `"creationTimestamp":null`, `"creationTimestamp":"null"`)
+	replaceString = strings.ReplaceAll(replaceString, `\"creationTimestamp\":null`, `\"creationTimestamp\":\"null\"`)
 
-	if err := d.Decode(&objMap); err != nil {
-		logrus.Errorf("Unable to decode json.")
+	finalString := strings.ReplaceAll(replaceString, `""`, `"null"`)
+	jsonParsed, err := gabs.ParseJSON([]byte(finalString))
+	if err != nil {
+		logrus.Errorf("Unable to parse json: %s, %s", groupVersion, kind)
+		return nil
+	}
+	// the yaml contains a list of resources
+	if _, err = jsonParsed.SetP("List", "kind"); err != nil {
+		logrus.Error("Unable to set kind for list.")
 		return nil
 	}
 
-	// Check that the obj has items
-	items, ok := objMap["items"].([]interface{})
-	if ok {
-		if len(items) > 0 {
-			return objMap
+	if _, err = jsonParsed.SetP("v1", "apiVersion"); err != nil {
+		logrus.Error("Unable to set apiVersion for list.")
+		return nil
+	}
+
+	for _, child := range jsonParsed.S("items").Children() {
+		if _, err = child.SetP(groupVersion, "apiVersion"); err != nil {
+			logrus.Error("Unable to set apiVersion field.")
+			return nil
+		}
+
+		if _, err = child.SetP(strings.Title(kind), "kind"); err != nil {
+			logrus.Error("Unable to set kind field.")
+			return nil
 		}
 	}
 
-	return nil
+	return jsonParsed.Data()
 }
 
 // Get all the namespaced resources for a given namespace
@@ -93,7 +108,7 @@ func (dc *DiscoveryClient) ResourcesForNamespace(namespace string) map[string]in
 			b, err := result.Raw()
 
 			if err == nil {
-				obj := toObj(b)
+				obj := toObj(b, gv.String(), resource.Kind)
 				if obj != nil {
 					objs[resource.Name] = obj
 				}
@@ -141,7 +156,7 @@ func (dc *DiscoveryClient) ResourcesForCluster() map[string]interface{} {
 			b, err := result.Raw()
 
 			if err == nil {
-				obj := toObj(b)
+				obj := toObj(b, gv.String(), resource.Kind)
 				if obj != nil {
 					objs[resource.Name] = obj
 				} else {
@@ -152,5 +167,4 @@ func (dc *DiscoveryClient) ResourcesForCluster() map[string]interface{} {
 	}
 
 	return objs
-
 }
